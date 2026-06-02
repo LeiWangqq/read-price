@@ -1,0 +1,8 @@
+venv/
+libs/
+__pycache__/
+*.pyc
+.read_price/
+.installed
+.installed_v2
+.claude/
