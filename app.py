@@ -276,38 +276,22 @@ def _sidebar_source():
         st.rerun()
 
 
-def _render_results(results: list[dict]):
-    if not results:
-        st.info("未在已索引文档中找到匹配内容。可尝试更换关键词或确认已建立索引。")
-        return
-
-    # 按文件分组
-    from collections import OrderedDict
-    grouped: OrderedDict[str, list[dict]] = OrderedDict()
-    for r in results:
-        fn = r.get("file", "?")
-        grouped.setdefault(fn, []).append(r)
-
-    total_hits = len(results)
-    total_files = len(grouped)
-    st.success(f"找到 {total_files} 个文件共 {total_hits} 处命中：")
-
-    for idx, (fn, items) in enumerate(grouped.items(), 1):
-        pages = [r.get("page", "—") for r in items]
-        pages_str = "、".join(str(p) for p in pages)
-        title = f"📄 {fn} | 第{pages_str}页 ({len(items)}处)"
-
-        with st.expander(title, expanded=idx == 1):
-            for r in items:
-                page = r.get("page", "—")
-                chapter = r.get("chapter", "—")
-                st.markdown(f"**第 {page} 页** [{chapter}]")
-                if r.get("reason"):
-                    st.caption(f"说明：{r['reason']}")
-                snippet = r.get("snippet", "")
-                if snippet:
-                    st.write(snippet)
-                st.divider()
+def _highlight(text: str, keywords: list[str]) -> str:
+    """将关键词用黄色背景标记。同时匹配裸关键词和 **加粗** 包裹的关键词。"""
+    import re
+    for kw in keywords:
+        # 先匹配 **关键词**（LLM 可能把查询词加粗）
+        pattern_bold = re.compile(re.escape(f"**{kw}**"))
+        text = pattern_bold.sub(
+            f'<span style="background:#ffd;padding:1px 4px;border-radius:3px"><b>{kw}</b></span>',
+            text)
+        # 再匹配裸关键词（仅匹配不在 <span> 标签内的）
+        pattern_bare = re.compile(
+            r'(?<!<b>)' + re.escape(kw) + r'(?!</b></span>)')
+        text = pattern_bare.sub(
+            f'<span style="background:#ffd;padding:1px 4px;border-radius:3px"><b>{kw}</b></span>',
+            text)
+    return text
 
 
 def main():
@@ -406,7 +390,57 @@ def main():
         for err in ocr_block_errors:
             st.warning(err)
 
-        _render_results(results)
+        # 按文件分组，逐文件流式渲染
+        if not results:
+            st.info("未在已索引文档中找到匹配内容。可尝试更换关键词或确认已建立索引。")
+        else:
+            from collections import OrderedDict
+            grouped: OrderedDict[str, list[dict]] = OrderedDict()
+            for r in results:
+                grouped.setdefault(r.get("file", "?"), []).append(r)
+
+            kws = locator.keywords(query.strip())
+            total_files = len(grouped)
+            st.success(f"找到 {total_files} 个文件共 {len(results)} 处命中：")
+
+            for idx, (fn, items) in enumerate(grouped.items(), 1):
+                pages = [r.get("page", "—") for r in items]
+                pages_str = "、".join(str(p) for p in pages)
+                title = f"📄 {fn} | 第{pages_str}页 ({len(items)}处)"
+
+                with st.expander(title, expanded=idx == 1):
+                    # 先显示原始匹配信息
+                    for r in items:
+                        page = r.get("page", "—")
+                        chapter = r.get("chapter", "—")
+                        st.markdown(f"**第 {page} 页** [{chapter}]")
+
+                    # 进度提示
+                    status = st.empty()
+                    status.caption(f"⏳ 正在 AI 整理 ({idx}/{total_files})：{fn}")
+
+                    # 流式调用大模型整理
+                    try:
+                        st.markdown("---")
+                        st.markdown("**AI 整理结果：**")
+                        text_area = st.empty()
+                        full_text = ""
+                        for chunk in llm.polish_file(
+                            cfg["base_url"], cfg["api_key"], cfg["model"],
+                            query.strip(), fn, items):
+                            full_text += chunk
+                            text_area.markdown(
+                                _highlight(full_text, kws),
+                                unsafe_allow_html=True)
+                        status.caption(f"✅ 已完成 ({idx}/{total_files})：{fn}")
+                    except Exception:
+                        status.caption(f"⚠️ AI 整理失败，显示原文 ({idx}/{total_files})：{fn}")
+                        for r in items:
+                            snippet = r.get("snippet", "")
+                            if snippet:
+                                st.markdown(
+                                    _highlight(snippet, kws),
+                                    unsafe_allow_html=True)
 
 
 if __name__ == "__main__":
