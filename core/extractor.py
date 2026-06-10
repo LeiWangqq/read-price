@@ -21,7 +21,7 @@ _CHAPTER_PATTERNS = [
 # 文本极少则疑似扫描页，触发 OCR
 _SCAN_TEXT_THRESHOLD = 10
 # 有图像且文本少于此值也判定为扫描页（处理叠加了少量文字的图片 PDF）
-_IMG_TEXT_THRESHOLD = 400  # 提升至 400，避免已 OCR 的 PDF 短表格页被误判
+_IMG_TEXT_THRESHOLD = 500
 # OCR 渲染分辨率（DPI 300 对中文小字识别率显著优于 200）
 _OCR_DPI = 300
 
@@ -50,21 +50,23 @@ def _is_garbled(text: str) -> bool:
             valid += 1
         elif ch in '，。、；：""''（）《》【】—…· \t\n':
             valid += 1
-    return valid / total < 0.25
+    return valid / total < 0.15
 
 
-def _has_text_blocks(page) -> bool:
+def _has_text_blocks(page) -> tuple[bool, int]:
     """检查页面是否包含真正的文本块（type=0）。
 
-    扫描仪生成的 PDF 中图像常以内联方式存储，page.get_images() 无法检测到。
-    通过 get_text("dict") 检查 block 类型是最可靠的方式：
-    如果页面没有任何文本块，说明是纯图像页（扫描件）。
+    返回 (是否有文本块, 文本块数量)。
+    文本块数 ≥ 5 时说明有足够文本结构，可直接判定为非扫描页。
     """
     try:
         td = page.get_text("dict")
-        return any(b.get("type") == 0 and b.get("spans") for b in td.get("blocks", []))
+        count = sum(1 for b in td.get("blocks", [])
+                    if b.get("type") == 0 and b.get("spans"))
+        return count > 0, count
     except Exception:
-        return len((page.get_text("text") or "").strip()) > 0
+        text = (page.get_text("text") or "").strip()
+        return len(text) > 0, 1 if text else 0
 
 
 def _detect_chapter(text: str) -> str | None:
@@ -165,7 +167,7 @@ def _extract_digital_pdf(doc, path: Path) -> list[dict]:
 
 
 def _extract_mixed_pdf(doc, path: Path) -> list[dict]:
-    """混合 PDF：逐页走 4 层判别逻辑（现有行为）。"""
+    """混合 PDF：逐页走判别逻辑。"""
     blocks: list[dict] = []
     chapter = "（未识别章节）"
     for i, page in enumerate(doc):
@@ -174,9 +176,15 @@ def _extract_mixed_pdf(doc, path: Path) -> list[dict]:
 
         is_scanned = text_len < _SCAN_TEXT_THRESHOLD
         if not is_scanned and text_len < _IMG_TEXT_THRESHOLD:
-            is_scanned = not _has_text_blocks(page)
-        if not is_scanned and _is_garbled(text):
-            is_scanned = True
+            has_blocks, block_count = _has_text_blocks(page)
+            # 文本块 ≥ 5 → 数字 PDF 页面，不判为扫描
+            if block_count >= 5:
+                is_scanned = False
+            else:
+                is_scanned = not has_blocks
+            # 文本块少但内容非乱码 → 保留为文本页
+            if is_scanned and text_len >= _SCAN_TEXT_THRESHOLD and not _is_garbled(text):
+                is_scanned = False
 
         if is_scanned:
             blocks.append(_scanned_block(path, i, chapter))
@@ -206,38 +214,6 @@ def _extract_pdf(path: Path) -> list[dict]:
             if pdf_type == "digital":
                 return _extract_digital_pdf(doc, path)
             return _extract_mixed_pdf(doc, path)
-        finally:
-            doc.close()
-    finally:
-        sys.stderr = old_stderr
-
-
-def render_pdf_page(path: str | Path, page_idx: int, dpi: int = _OCR_DPI):
-    """按需渲染单个 PDF 页面为 numpy RGB 数组，供 OCR 使用。
-
-    PyMuPDF 对格式不规范的 PDF 会打印 MuPDF error 到 stderr，
-    这些通常是警告而非致命错误，渲染仍可继续。
-    """
-    import contextlib
-    import io
-    import sys
-
-    import numpy as np
-    from PIL import Image
-
-    import fitz
-
-    # 抑制 MuPDF stderr 警告（不中断处理）
-    mupdf_stderr = io.StringIO()
-    old_stderr = sys.stderr
-    sys.stderr = mupdf_stderr
-    try:
-        doc = fitz.open(path)
-        try:
-            page = doc[page_idx]
-            pix = page.get_pixmap(dpi=dpi)
-            img = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
-            return np.array(img)
         finally:
             doc.close()
     finally:
@@ -293,10 +269,17 @@ def _convert_doc_to_docx(src: Path) -> Path | None:
     return None
 
 
-def _parse_docx_blocks(path: Path, display_name: str) -> list[dict]:
-    """从 .docx 解析段落并返回 block 列表。display_name 用于 block 的 file 字段。"""
+def _parse_docx_blocks(path: Path, display_name: str,
+                       original_path: Path | None = None) -> list[dict]:
+    """从 .docx 解析段落并返回 block 列表。
+
+    path: 实际读取的文件路径（可能是转换后的临时文件）
+    display_name: 用于 block 的 file 字段的显示名
+    original_path: 存入 block 的 path 字段（默认等于 path）
+    """
     import docx
 
+    store_path = original_path or path
     document = docx.Document(path)
     blocks: list[dict] = []
     current_chapter = "（未识别章节）"
@@ -307,7 +290,7 @@ def _parse_docx_blocks(path: Path, display_name: str) -> list[dict]:
             blocks.append(
                 {
                     "file": display_name,
-                    "path": str(path),
+                    "path": str(store_path),
                     "page": None,
                     "chapter": current_chapter,
                     "text": "\n".join(buffer).strip(),
@@ -349,7 +332,8 @@ def _extract_doc(path: Path) -> list[dict]:
     converted = _convert_doc_to_docx(path)
     if converted:
         try:
-            return _parse_docx_blocks(converted, path.name)
+            return _parse_docx_blocks(converted, path.name,
+                                       original_path=path)
         finally:
             try:
                 converted.unlink()

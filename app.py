@@ -5,6 +5,20 @@ import sys
 import tempfile
 from pathlib import Path
 
+# ── 版本检查：libs/ 中的 .pyd 仅兼容 Python 3.12 ──────────
+if sys.version_info[:2] != (3, 12):
+    print(
+        f"[ERROR] 当前 Python {sys.version_info.major}.{sys.version_info.minor}，"
+        f"需要 Python 3.12。\n"
+        f"libs/ 中的二进制包（cv2、numpy 等）仅兼容 3.12。\n"
+        f"解决方案：\n"
+        f"  1. 安装 Python 3.12: https://www.python.org/downloads/\n"
+        f"  2. 或用当前版本重建 libs/:\n"
+        f"     python -m pip install --target libs -r requirements.txt",
+        file=sys.stderr,
+    )
+    sys.exit(1)
+
 # 将项目本地 libs 目录加入 sys.path（优先于系统包）
 _libs = Path(__file__).resolve().parent / "libs"
 if _libs.exists():
@@ -32,6 +46,10 @@ def _init_state():
         st.session_state.blocks = []
     if "index_info" not in st.session_state:
         st.session_state.index_info = ""
+    if "search_results" not in st.session_state:
+        st.session_state.search_results = None
+    if "search_query" not in st.session_state:
+        st.session_state.search_query = ""
 
 
 def _sidebar_config():
@@ -79,84 +97,164 @@ def _sidebar_config():
 
 
 def _sidebar_cache():
-    st.sidebar.header("② 缓存目录")
-    cfg = st.session_state.cfg
-    current_cache = cfg.get("cache_dir", "")
+    st.sidebar.header("② 缓存提取")
 
-    if current_cache:
-        st.sidebar.success(f"自定义缓存：{current_cache}")
+    # 显示缓存版本列表
+    sessions = config.list_cache_sessions()
+    if sessions:
+        st.sidebar.caption(f"缓存共 {len(sessions)} 个版本：")
+        for s in sessions[:5]:  # 最多显示 5 个
+            size_mb = s["total_bytes"] / (1024 * 1024)
+            st.sidebar.caption(
+                f"  {s['time_str']}  {s['file_count']} 文件  {size_mb:.1f} MB")
     else:
-        st.sidebar.caption(f"默认缓存：{config._DEFAULT_CACHE_DIR}")
+        st.sidebar.caption("暂无缓存。请先建立索引。")
 
-    # 显示缓存统计
-    cache_count = 0
-    if config.CACHE_DIR.exists():
-        cache_count = len(list(config.CACHE_DIR.glob("*.pkl")))
-    if cache_count:
-        st.sidebar.info(f"当前缓存中有 {cache_count} 个已索引文件")
+    # 加载方式
+    cache_mode = st.sidebar.radio(
+        "加载方式", ["从最新缓存加载", "从历史缓存加载"],
+        horizontal=True, key="cache_load_mode")
 
-    # 浏览选择缓存目录
-    if "cache_dir_input" not in st.session_state:
-        st.session_state.cache_dir_input = current_cache
+    if cache_mode == "从最新缓存加载":
+        # 从文件夹 / 单个文件加载（搜索最新会话或全部缓存）
+        sub_mode = st.sidebar.radio(
+            "范围", ["文件夹", "单个文件"], horizontal=True,
+            key="cache_sub_mode")
 
-    if st.sidebar.button("📁 浏览选择缓存目录", use_container_width=True):
-        picked = _pick_folder()
-        if picked:
-            st.session_state.cache_dir_input = picked
-
-    cache_input = st.sidebar.text_input(
-        "缓存目录路径（可手动编辑）", key="cache_dir_input",
-        placeholder=r"D:\read-price-cache")
-
-    col1, col2 = st.columns(2)
-    with col1:
-        apply_clicked = st.button("应用", use_container_width=True)
-    with col2:
-        reset_clicked = st.button("恢复默认", use_container_width=True)
-
-    if apply_clicked:
-        if cache_input.strip():
-            config.set_cache_dir(cache_input.strip())
-            cfg["cache_dir"] = cache_input.strip()
-            config.save_config(
-                cfg["base_url"], cfg["api_key"], cfg["model"],
-                cache_dir=cache_input.strip())
-            st.session_state.cfg = cfg
-            st.success("已切换缓存目录")
-            st.rerun()
+        if sub_mode == "文件夹":
+            if "cache_folder_input" not in st.session_state:
+                st.session_state.cache_folder_input = ""
+            if st.sidebar.button("📁 浏览选择文件夹", use_container_width=True,
+                                 key="btn_cache_browse"):
+                picked = _pick_folder()
+                if picked:
+                    st.session_state.cache_folder_input = picked
+            folder = st.sidebar.text_input(
+                "文件夹路径", key="cache_folder_input",
+                placeholder=r"D:\价格台账")
+            if st.sidebar.button("加载缓存", use_container_width=True,
+                                 type="primary", key="btn_cache_folder"):
+                if not folder.strip():
+                    st.sidebar.error("请填写文件夹路径")
+                else:
+                    # 优先搜索最新会话，再搜索全部缓存
+                    latest = config.latest_cache_session()
+                    blocks = config.load_cached_blocks_for(
+                        folder.strip(), session_dir=latest)
+                    if not blocks:
+                        blocks = config.load_cached_blocks_for(folder.strip())
+                    if blocks:
+                        st.session_state.blocks = blocks
+                        st.session_state.index_info = (
+                            f"已从缓存加载 {len(blocks)} 个文本块。")
+                        st.rerun()
+                    else:
+                        st.sidebar.warning("该文件夹下无缓存数据，请先建立索引。")
         else:
-            st.warning("请输入或浏览选择缓存目录路径")
+            if "cache_file_input" not in st.session_state:
+                st.session_state.cache_file_input = ""
+            if st.sidebar.button("📁 浏览选择文件", use_container_width=True,
+                                 key="btn_cache_file_browse"):
+                picked = _pick_file()
+                if picked:
+                    st.session_state.cache_file_input = picked
+            single = st.sidebar.text_input(
+                "文件路径", key="cache_file_input",
+                placeholder=r"D:\合同\价格表.pdf")
+            if st.sidebar.button("加载缓存", use_container_width=True,
+                                 type="primary", key="btn_cache_file"):
+                if not single.strip():
+                    st.sidebar.error("请填写文件路径")
+                elif not Path(single.strip()).is_file():
+                    st.sidebar.error(f"文件不存在：{single.strip()}")
+                else:
+                    latest = config.latest_cache_session()
+                    blocks = config.load_cached_blocks_for(
+                        single.strip(), session_dir=latest)
+                    if not blocks:
+                        blocks = config.load_cached_blocks_for(single.strip())
+                    if blocks:
+                        st.session_state.blocks = blocks
+                        st.session_state.index_info = (
+                            f"已从缓存加载 {len(blocks)} 个文本块。")
+                        st.rerun()
+                    else:
+                        st.sidebar.warning("该文件无缓存数据，请先建立索引。")
 
-    if reset_clicked:
-        config.reset_cache_dir()
-        cfg["cache_dir"] = ""
-        config.save_config(
-            cfg["base_url"], cfg["api_key"], cfg["model"],
-            cache_dir="")
-        st.session_state.cfg = cfg
-        st.success("已恢复默认缓存")
-        st.rerun()
+    elif cache_mode == "从历史缓存加载":
+        if not sessions:
+            st.sidebar.info("暂无历史缓存。")
+        else:
+            options = [
+                f"{s['time_str']}  ({s['file_count']} 文件, "
+                f"{s['total_bytes'] / (1024*1024):.1f} MB)"
+                for s in sessions
+            ]
+            sel = st.sidebar.selectbox("选择历史版本", options, key="session_select")
+            sel_idx = options.index(sel) if sel in options else 0
+            sel_session = sessions[sel_idx]
 
-    # 自动加载缓存中的 blocks（首次进入且有缓存时）
-    if not st.session_state.blocks and cache_count:
-        blocks = _load_cache_blocks()
-        if blocks:
-            st.session_state.blocks = blocks
+            col_load, col_del = st.columns(2)
+            with col_load:
+                if st.button("📥 加载选中版本", use_container_width=True,
+                             type="primary", key="btn_load_session"):
+                    all_blocks = config.load_session_blocks(sel_session["path"])
+                    if all_blocks:
+                        st.session_state.blocks = all_blocks
+                        st.session_state.index_info = (
+                            f"已加载历史版本 {sel_session['time_str']}，"
+                            f"共 {len(all_blocks)} 个文本块。")
+                        st.rerun()
+                    else:
+                        st.sidebar.warning("该版本缓存为空。")
+            with col_del:
+                if st.button("🗑️ 删除此版本", use_container_width=True,
+                             key="btn_del_session"):
+                    if config.delete_cache_session(sel_session["path"]):
+                        st.sidebar.success(f"已删除 {sel_session['time_str']}")
+                        st.rerun()
+
+    # 重建索引 & 清除所有缓存
+    col_a, col_b = st.columns(2)
+    with col_a:
+        if st.button("🔄 重建索引", use_container_width=True,
+                     key="btn_rebuild"):
+            st.session_state["_force_rebuild"] = True
+            st.sidebar.info("已标记重建，下次扫描将跳过缓存")
+    with col_b:
+        if st.sidebar.button("🗑️ 清除所有缓存", use_container_width=True,
+                             type="secondary", key="btn_clear_all_cache"):
+            st.session_state.blocks = []
+            st.session_state.index_info = ""
+            cache_dir = config.CACHE_DIR
+            if cache_dir.exists():
+                import shutil
+                shutil.rmtree(cache_dir, ignore_errors=True)
+                cache_dir.mkdir(parents=True, exist_ok=True)
+            st.sidebar.success("缓存已清除。")
+            st.rerun()
+
+    # 首次自动加载（最新会话，或旧格式平铺 pkl）
+    if not st.session_state.blocks:
+        all_blocks = []
+        loaded_from = ""
+        if sessions:
+            latest_session = sessions[0]
+            all_blocks = config.load_session_blocks(latest_session["path"])
+            loaded_from = latest_session["time_str"]
+        elif config.CACHE_DIR.exists():
+            # 兼容旧格式：直接加载平铺在 cache/ 下的 pkl
+            import pickle
+            for pkl_file in config.CACHE_DIR.glob("*.pkl"):
+                try:
+                    all_blocks.extend(pickle.loads(pkl_file.read_bytes()))
+                except (pickle.PickleError, OSError):
+                    continue
+            loaded_from = "旧格式缓存"
+        if all_blocks:
+            st.session_state.blocks = all_blocks
             st.session_state.index_info = (
-                f"已从缓存加载 {len(blocks)} 个文本块（{cache_count} 个文件）。")
-
-
-def _load_cache_blocks() -> list[dict]:
-    """从当前缓存目录加载所有已缓存的 blocks。"""
-    import pickle
-    blocks = []
-    for pkl_file in config.CACHE_DIR.glob("*.pkl"):
-        try:
-            file_blocks = pickle.loads(pkl_file.read_bytes())
-            blocks.extend(file_blocks)
-        except (pickle.PickleError, OSError):
-            continue
-    return blocks
+                f"已自动加载 {loaded_from}，共 {len(all_blocks)} 个文本块。")
 
 
 def _progress_factory(bar, label):
@@ -168,11 +266,19 @@ def _progress_factory(bar, label):
 
 
 def _pick_folder() -> str:
-    """弹出本机系统文件夹选择对话框，返回所选路径（取消/失败返回空串）。
+    """弹出本机系统文件夹选择对话框，返回所选路径（取消/失败返回空串）。"""
+    return _tk_dialog("filedialog.askdirectory()")
 
-    Streamlit 脚本运行在工作线程，tkinter 必须在主线程，故放到独立子进程里运行，
-    选中的路径通过临时文件以 UTF-8 回传，避免中文路径编码问题。
-    """
+
+def _pick_file() -> str:
+    """弹出本机系统文件选择对话框，返回所选路径（取消/失败返回空串）。"""
+    return _tk_dialog(
+        "filedialog.askopenfilename(filetypes=["
+        "('PDF/Word','*.pdf *.docx *.doc'),('All','*.*')])")
+
+
+def _tk_dialog(expr: str) -> str:
+    """在子进程中运行 tkinter 对话框，通过临时文件回传路径。"""
     import os
     import subprocess
     import sys
@@ -184,7 +290,7 @@ def _pick_folder() -> str:
         "import sys, tkinter as tk\n"
         "from tkinter import filedialog\n"
         "root = tk.Tk(); root.withdraw(); root.wm_attributes('-topmost', 1)\n"
-        "p = filedialog.askdirectory()\n"
+        f"p = {expr}\n"
         "open(sys.argv[1], 'w', encoding='utf-8').write(p or '')\n"
     )
     kwargs = {"timeout": 300}
@@ -205,12 +311,15 @@ def _pick_folder() -> str:
 
 def _sidebar_source():
     st.sidebar.header("③ 文档来源")
-    source = st.sidebar.radio("选择方式", ["本地文件夹", "上传文件"], horizontal=True)
+    source = st.sidebar.radio(
+        "选择方式", ["本地文件夹", "上传文件"], horizontal=True)
+    force = st.session_state.pop("_force_rebuild", False)
 
     if source == "本地文件夹":
         if "folder_input" not in st.session_state:
             st.session_state.folder_input = ""
-        if st.sidebar.button("📁 浏览选择文件夹", use_container_width=True):
+        if st.sidebar.button("📁 浏览选择文件夹", use_container_width=True,
+                             key="btn_src_browse"):
             picked = _pick_folder()
             if picked:
                 st.session_state.folder_input = picked
@@ -222,20 +331,9 @@ def _sidebar_source():
             if not folder.strip():
                 st.sidebar.error("请填写文件夹路径")
             else:
-                bar = st.sidebar.progress(0.0)
-                label = st.sidebar.empty()
-                try:
-                    blocks = indexer.index_folder(
-                        folder.strip(), progress=_progress_factory(bar, label))
-                    st.session_state.blocks = blocks
-                    st.session_state.index_info = (
-                        f"已索引文件夹「{folder}」，共 {len(blocks)} 个文本块。")
-                    label.caption("完成")
-                except NotADirectoryError as e:
-                    st.sidebar.error(str(e))
-                except Exception as e:  # noqa: BLE001
-                    st.sidebar.error(f"索引失败：{e}")
-    else:
+                _do_index(source, folder.strip(), force)
+
+    elif source == "上传文件":
         uploaded = st.sidebar.file_uploader(
             "上传 PDF / Word", type=["pdf", "docx", "doc"],
             accept_multiple_files=True)
@@ -249,49 +347,72 @@ def _sidebar_source():
                     p = tmp_dir / uf.name
                     p.write_bytes(uf.getbuffer())
                     paths.append(str(p))
-                bar = st.sidebar.progress(0.0)
-                label = st.sidebar.empty()
-                try:
-                    blocks = indexer.index_paths(
-                        paths, progress=_progress_factory(bar, label))
-                    st.session_state.blocks = blocks
-                    st.session_state.index_info = (
-                        f"已索引上传的 {len(uploaded)} 个文件，"
-                        f"共 {len(blocks)} 个文本块。")
-                    label.caption("完成")
-                except Exception as e:  # noqa: BLE001
-                    st.sidebar.error(f"索引失败：{e}")
-
-    st.sidebar.divider()
-    if st.sidebar.button("🗑️ 清除所有缓存", use_container_width=True,
-                         type="secondary"):
-        st.session_state.blocks = []
-        st.session_state.index_info = ""
-        cache_dir = config.CACHE_DIR
-        if cache_dir.exists():
-            import shutil
-            shutil.rmtree(cache_dir, ignore_errors=True)
-            cache_dir.mkdir(parents=True, exist_ok=True)
-        st.sidebar.success("缓存已清除，请重新建立索引。")
-        st.rerun()
+                _do_index(source, paths, force)
 
 
 def _highlight(text: str, keywords: list[str]) -> str:
-    """将关键词用黄色背景标记。同时匹配裸关键词和 **加粗** 包裹的关键词。"""
+    """将关键词用黄色背景标记。单遍替换策略，避免多轮嵌套。"""
+    import html as html_mod
     import re
+    # 先对文本做 HTML 转义，防止注入
+    text = html_mod.escape(text)
+    # 将 Markdown 加粗语法 **xxx** 转为 <b>xxx</b>，以便后续统一处理
+    text = re.sub(r'\*\*(.+?)\*\*', r'<b>\1</b>', text)
     for kw in keywords:
-        # 先匹配 **关键词**（LLM 可能把查询词加粗）
-        pattern_bold = re.compile(re.escape(f"**{kw}**"))
-        text = pattern_bold.sub(
-            f'<span style="background:#ffd;padding:1px 4px;border-radius:3px"><b>{kw}</b></span>',
-            text)
-        # 再匹配裸关键词（仅匹配不在 <span> 标签内的）
-        pattern_bare = re.compile(
-            r'(?<!<b>)' + re.escape(kw) + r'(?!</b></span>)')
-        text = pattern_bare.sub(
-            f'<span style="background:#ffd;padding:1px 4px;border-radius:3px"><b>{kw}</b></span>',
+        safe_kw = html_mod.escape(kw)
+        pattern = re.compile(re.escape(safe_kw), re.IGNORECASE)
+        text = pattern.sub(
+            f'<span style="background:#ffd;padding:1px 4px;border-radius:3px">'
+            f'<b>{safe_kw}</b></span>',
             text)
     return text
+
+
+def _render_snippet_card(items: list[dict], keywords: list[str]) -> None:
+    """非 LLM 回退：生成页码+内容表格。"""
+    if not items:
+        return
+    lines = ["| 页码 | 内容 |", "|:----:|------|"]
+    for r in items:
+        page = r.get("page", "—")
+        snippet = r.get("snippet", "")[:200]
+        highlighted = _highlight(snippet, keywords)
+        lines.append(f"| {page} | {highlighted} |")
+    st.markdown("\n".join(lines), unsafe_allow_html=True)
+
+
+def _do_index(source, paths_or_folder, force: bool, session_dir=None):
+    """统一索引入口：显示进度条，更新 session_state。"""
+    # 如果没有指定会话，创建新的时间戳会话
+    if session_dir is None:
+        session_dir = config.new_cache_session()
+    bar = st.sidebar.progress(0.0)
+    label = st.sidebar.empty()
+    try:
+        if source == "本地文件夹":
+            blocks = indexer.index_folder(
+                paths_or_folder, progress=_progress_factory(bar, label),
+                force=force, session_dir=session_dir)
+            desc = f"文件夹「{paths_or_folder}」"
+        elif source == "单个文件":
+            blocks = indexer.index_paths(
+                [paths_or_folder], progress=_progress_factory(bar, label),
+                force=force, session_dir=session_dir)
+            desc = f"文件「{Path(paths_or_folder).name}」"
+        else:  # 上传文件
+            blocks = indexer.index_paths(
+                paths_or_folder, progress=_progress_factory(bar, label),
+                force=force, session_dir=session_dir)
+            desc = f"{len(paths_or_folder)} 个上传文件"
+        st.session_state.blocks = blocks
+        st.session_state.index_info = (
+            f"已索引{desc}，共 {len(blocks)} 个文本块。"
+            f"（缓存版本：{session_dir.name}）")
+        label.caption("完成")
+    except NotADirectoryError as e:
+        st.sidebar.error(str(e))
+    except Exception as e:  # noqa: BLE001
+        st.sidebar.error(f"索引失败：{e}")
 
 
 def main():
@@ -313,9 +434,10 @@ def main():
 
     if go:
         cfg = st.session_state.cfg
-        if not config.is_configured(cfg):
-            st.error("请先在左侧配置大模型接口。")
-            return
+        # 清空旧结果
+        st.session_state.search_results = None
+        st.session_state.search_query = ""
+
         if not st.session_state.blocks:
             st.error("请先在左侧建立文档索引。")
             return
@@ -323,124 +445,95 @@ def main():
             st.error("请输入查询内容。")
             return
 
-        # --- 诊断输出 ---
         blocks = st.session_state.blocks
-        scanned_blocks = [b for b in blocks if b.get("scanned")]
-        text_blocks = [b for b in blocks if not b.get("scanned") and b.get("text")]
-        scanned_files = set(b["file"] for b in scanned_blocks)
-        text_files = set(b["file"] for b in text_blocks)
-        st.caption(
-            f"索引状态：共 {len(blocks)} 块 | "
-            f"文本块 {len(text_blocks)}（{len(text_files)} 文件）| "
-            f"扫描块 {len(scanned_blocks)}（{len(scanned_files)} 文件）"
-        )
-        if scanned_files:
-            with st.expander("扫描文件列表"):
-                for fn in sorted(scanned_files):
-                    cnt = sum(1 for b in scanned_blocks if b["file"] == fn)
-                    ocr_done = sum(1 for b in scanned_blocks
-                                   if b["file"] == fn and b.get("text"))
-                    st.write(f"  {fn}: {cnt} 页 (已OCR: {ocr_done})")
-        # --- 诊断输出结束 ---
 
         with st.spinner("正在检索并定位..."):
             try:
-                results, ocr_errors = locator.locate(
-                    st.session_state.blocks, query.strip(), cfg)
+                results, ocr_errors = locator.locate(blocks, query.strip(), cfg)
             except Exception as e:
                 st.error(f"搜索出错：{type(e).__name__}: {e}")
                 return
 
-        # --- 搜索诊断 ---
-        with st.expander("搜索诊断"):
-            # 检查 OCR 后哪些文件有匹配
-            kws = locator.keywords(query.strip())
-            st.write(f"**关键词**: {kws}")
-            file_match_counts: dict[str, int] = {}
-            for b in st.session_state.blocks:
-                text = b.get("text", "")
-                if not text:
-                    continue
-                score = sum(text.count(k) for k in kws)
-                if score > 0:
-                    fn = b["file"]
-                    file_match_counts[fn] = file_match_counts.get(fn, 0) + score
-            if file_match_counts:
-                st.write(f"**关键词命中的文件** ({len(file_match_counts)} 个):")
-                for fn, cnt in sorted(file_match_counts.items(),
-                                       key=lambda x: -x[1]):
-                    st.write(f"  - {fn}: 命中 {cnt} 次")
+        # 存入 session_state，下次查询前会被清空
+        st.session_state.search_query = query.strip()
+        st.session_state.search_results = {
+            "results": results,
+            "ocr_errors": ocr_errors,
+        }
+
+    # 从 session_state 渲染结果（新查询时上面已清空，此处不会输出旧结果）
+    data = st.session_state.search_results
+    if data is None:
+        return
+
+    results = data["results"]
+    ocr_errors = data["ocr_errors"]
+    query_text = st.session_state.search_query
+    blocks = st.session_state.blocks
+    cfg = st.session_state.cfg
+
+    for err in ocr_errors:
+        st.warning(err)
+    for b in blocks:
+        if b.get("_ocr_error"):
+            st.warning(b["_ocr_error"])
+
+    # 诊断（折叠）
+    with st.expander("诊断信息", expanded=False):
+        kws = locator.keywords(query_text)
+        ocr_done = sum(1 for b in blocks if b.get("scanned") and b.get("text"))
+        ocr_total = sum(1 for b in blocks if b.get("scanned"))
+        st.write(f"关键词: {kws} | 命中: {len(results)} 处 | OCR: {ocr_done}/{ocr_total}")
+
+    if not results:
+        st.info("未在已索引文档中找到匹配内容。可尝试更换关键词或确认已建立索引。")
+        return
+
+    from collections import OrderedDict
+    grouped: OrderedDict[str, list[dict]] = OrderedDict()
+    for r in results:
+        grouped.setdefault(r.get("file", "?"), []).append(r)
+
+    kws = locator.keywords(query_text)
+    llm_ready = config.is_configured(cfg)
+    total_files = len(grouped)
+    st.success(f"找到 {total_files} 个文件共 {len(results)} 处命中：")
+
+    # 总览表格
+    summary_lines = ["| 文件 | 页码 |", "|------|------|"]
+    for fn, items in grouped.items():
+        pages = sorted({r.get("page", "—") for r in items}, key=lambda x: (x == "—", x))
+        summary_lines.append(f"| {fn} | {'、'.join(str(p) for p in pages)} |")
+    st.markdown("\n".join(summary_lines))
+
+    for idx, (fn, items) in enumerate(grouped.items(), 1):
+        pages = [r.get("page", "—") for r in items]
+        pages_str = "、".join(str(p) for p in pages)
+        title = f"📄 {fn} | 第{pages_str}页 ({len(items)}处)"
+
+        with st.expander(title, expanded=idx == 1):
+            if llm_ready:
+                status = st.empty()
+                status.caption(f"⏳ AI 整理 ({idx}/{total_files})：{fn}")
+                try:
+                    text_area = st.empty()
+                    full_text = ""
+                    for chunk in llm.polish_file(
+                        cfg["base_url"], cfg["api_key"], cfg["model"],
+                        query_text, fn, items):
+                        full_text += chunk
+                        text_area.markdown(full_text)
+                    status.caption(f"✅ 完成 ({idx}/{total_files})：{fn}")
+                except llm.LLMError as e:
+                    status.caption(f"⚠️ AI 整理失败 ({idx}/{total_files})")
+                    st.warning(str(e))
+                    _render_snippet_card(items, kws)
+                except Exception as e:
+                    status.caption(f"⚠️ AI 整理异常 ({idx}/{total_files})")
+                    st.warning(f"{type(e).__name__}: {e}")
+                    _render_snippet_card(items, kws)
             else:
-                st.write("**没有文件包含这些关键词**（OCR 可能未完成或识别质量不佳）")
-            scanned_done = sum(1 for b in st.session_state.blocks
-                               if b.get("scanned") and b.get("text"))
-            scanned_total = sum(1 for b in st.session_state.blocks
-                                if b.get("scanned"))
-            st.write(f"**扫描页 OCR 状态**: {scanned_done}/{scanned_total} 已完成")
-        # --- 诊断结束 ---
-
-        for err in ocr_errors:
-            st.warning(err)
-
-        # 显示 OCR 失败的页面
-        ocr_block_errors = [
-            b["_ocr_error"] for b in st.session_state.blocks
-            if b.get("_ocr_error")
-        ]
-        for err in ocr_block_errors:
-            st.warning(err)
-
-        # 按文件分组，逐文件流式渲染
-        if not results:
-            st.info("未在已索引文档中找到匹配内容。可尝试更换关键词或确认已建立索引。")
-        else:
-            from collections import OrderedDict
-            grouped: OrderedDict[str, list[dict]] = OrderedDict()
-            for r in results:
-                grouped.setdefault(r.get("file", "?"), []).append(r)
-
-            kws = locator.keywords(query.strip())
-            total_files = len(grouped)
-            st.success(f"找到 {total_files} 个文件共 {len(results)} 处命中：")
-
-            for idx, (fn, items) in enumerate(grouped.items(), 1):
-                pages = [r.get("page", "—") for r in items]
-                pages_str = "、".join(str(p) for p in pages)
-                title = f"📄 {fn} | 第{pages_str}页 ({len(items)}处)"
-
-                with st.expander(title, expanded=idx == 1):
-                    # 先显示原始匹配信息
-                    for r in items:
-                        page = r.get("page", "—")
-                        chapter = r.get("chapter", "—")
-                        st.markdown(f"**第 {page} 页** [{chapter}]")
-
-                    # 进度提示
-                    status = st.empty()
-                    status.caption(f"⏳ 正在 AI 整理 ({idx}/{total_files})：{fn}")
-
-                    # 流式调用大模型整理
-                    try:
-                        st.markdown("---")
-                        st.markdown("**AI 整理结果：**")
-                        text_area = st.empty()
-                        full_text = ""
-                        for chunk in llm.polish_file(
-                            cfg["base_url"], cfg["api_key"], cfg["model"],
-                            query.strip(), fn, items):
-                            full_text += chunk
-                            text_area.markdown(
-                                _highlight(full_text, kws),
-                                unsafe_allow_html=True)
-                        status.caption(f"✅ 已完成 ({idx}/{total_files})：{fn}")
-                    except Exception:
-                        status.caption(f"⚠️ AI 整理失败，显示原文 ({idx}/{total_files})：{fn}")
-                        for r in items:
-                            snippet = r.get("snippet", "")
-                            if snippet:
-                                st.markdown(
-                                    _highlight(snippet, kws),
-                                    unsafe_allow_html=True)
+                _render_snippet_card(items, kws)
 
 
 if __name__ == "__main__":

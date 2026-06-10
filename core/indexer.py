@@ -5,7 +5,6 @@
 """
 from __future__ import annotations
 
-import hashlib
 import os
 import pickle
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -14,27 +13,18 @@ from pathlib import Path
 from core import config, extractor
 
 _SUPPORTED = (".pdf", ".docx", ".doc")
-_CACHE_VERSION = 10  # block 格式变更时递增，自动使旧缓存失效
-
 _FILE_PARALLEL_THRESHOLD = 3
-_OCR_WORKERS = 4  # 并行 OCR 线程数
-
-
-def _cache_path(path: Path) -> Path:
-    mtime = path.stat().st_mtime_ns
-    key = f"{path.resolve()}|{mtime}|v{_CACHE_VERSION}"
-    digest = hashlib.md5(key.encode("utf-8")).hexdigest()
-    return config.CACHE_DIR / f"{digest}.pkl"
 
 
 def _ocr_scanned_blocks(blocks: list[dict], progress=None) -> list[dict]:
     """对 block 列表中所有未 OCR 的扫描页做 OCR。
 
-    按文件分组批量渲染（每个 PDF 只打开一次），然后多线程 OCR。
-    支持纠偏预处理和低置信度重试。
+    流水线架构：主线程串行渲染 → 队列 → 8 线程并行 OCR。
+    渲染速度 (~0.07s/页) 远快于 OCR (~0.8s/页)，队列始终满载，OCR 线程无空闲。
     """
     from collections import defaultdict
-    from concurrent.futures import ThreadPoolExecutor, as_completed
+    from queue import Queue
+    from threading import Thread
 
     import fitz
     import numpy as np
@@ -50,72 +40,80 @@ def _ocr_scanned_blocks(blocks: list[dict], progress=None) -> list[dict]:
     if progress:
         progress(0, total, f"正在渲染并识别 {total} 页扫描内容...")
 
-    # 按文件分组，减少 PDF 打开次数
     by_file: dict[str, list[dict]] = defaultdict(list)
     for b in need:
         by_file[b["render_info"]["pdf_path"]].append(b)
 
-    # 批量渲染：每个文件只 fitz.open() 一次
-    render_jobs: list[tuple[dict, np.ndarray]] = []
+    # 流水线：渲染线程往队列写 (block, image)，OCR 工作线程从队列读
+    q: Queue = Queue(maxsize=8)
+    SENTINEL = None  # 结束信号
 
-    for pdf_path, file_blocks in by_file.items():
-        try:
-            import io
-            import sys
-
-            # 抑制 MuPDF stderr 警告
-            old_stderr = sys.stderr
-            sys.stderr = io.StringIO()
+    def render_all():
+        """主线程串行渲染所有页面，复用 doc handle。"""
+        for pdf_path, file_blocks in by_file.items():
             try:
-                doc = fitz.open(pdf_path)
+                import io
+                import sys
+                old_stderr = sys.stderr
+                sys.stderr = io.StringIO()
                 try:
-                    for b in file_blocks:
-                        info = b["render_info"]
-                        page = doc[info["page_idx"]]
-                        pix = page.get_pixmap(dpi=info.get("dpi", 300))
-                        img = Image.frombytes(
-                            "RGB", (pix.width, pix.height), pix.samples)
-                        render_jobs.append((b, np.array(img)))
+                    doc = fitz.open(pdf_path)
+                    try:
+                        for b in file_blocks:
+                            info = b["render_info"]
+                            page = doc[info["page_idx"]]
+                            pix = page.get_pixmap(dpi=info.get("dpi", 300))
+                            img = np.array(Image.frombytes(
+                                "RGB", (pix.width, pix.height), pix.samples))
+                            q.put((b, img))
+                    finally:
+                        doc.close()
                 finally:
-                    doc.close()
-            finally:
-                sys.stderr = old_stderr
-        except Exception as e:
-            for b in file_blocks:
-                b["text"] = ""
-                b["_ocr_error"] = (
-                    f"文件「{b.get('file', '?')}」第 {b.get('page', '?')} 页 "
-                    f"渲染失败: {type(e).__name__}: {e}"
+                    sys.stderr = old_stderr
+            except Exception as e:
+                for b in file_blocks:
+                    b["text"] = ""
+                    b["_ocr_error"] = (
+                        f"文件「{b.get('file', '?')}」第 {b.get('page', '?')} 页 "
+                        f"渲染失败: {type(e).__name__}: {e}"
+                    )
+        q.put(SENTINEL)
+
+    def ocr_worker():
+        """OCR 工作线程：从队列取图，做 OCR，写回 block。"""
+        while True:
+            item = q.get()
+            if item is SENTINEL:
+                q.put(SENTINEL)  # 传递给下一个 worker
+                break
+            block, img = item
+            try:
+                text, conf = ocr.image_to_text_with_retry(img)
+                block["text"] = text
+                if text:
+                    ch = extractor._detect_chapter(text)
+                    if ch:
+                        block["chapter"] = ch
+            except Exception as e:
+                block["text"] = ""
+                block["_ocr_error"] = (
+                    f"文件「{block.get('file', '?')}」第 {block.get('page', '?')} 页 "
+                    f"OCR 失败: {type(e).__name__}: {e}"
                 )
 
-    # 多线程 OCR（纠偏在 ocr.image_to_text_with_retry 内部执行）
-    def _ocr_one(job):
-        block, img = job
-        try:
-            text, conf = ocr.image_to_text_with_retry(img)
-            return block, text, conf, None
-        except Exception as e:
-            return block, "", 0.0, (
-                f"文件「{block.get('file', '?')}」第 {block.get('page', '?')} 页 "
-                f"OCR 失败: {type(e).__name__}: {e}"
-            )
+    # 启动 OCR 工作线程
+    ocr_workers = []
+    for _ in range(8):
+        t = Thread(target=ocr_worker, daemon=True)
+        t.start()
+        ocr_workers.append(t)
 
-    done = 0
+    # 主线程做渲染（阻塞直到全部完成）
+    render_all()
 
-    with ThreadPoolExecutor(max_workers=4) as ex:
-        futures = {ex.submit(_ocr_one, job): job for job in render_jobs}
-        for fut in as_completed(futures):
-            block, text, conf, err = fut.result()
-            block["text"] = text
-            if err:
-                block["_ocr_error"] = err
-            if text:
-                ch = extractor._detect_chapter(text)
-                if ch:
-                    block["chapter"] = ch
-            done += 1
-            if progress and done % 4 == 0:
-                progress(done, total, f"OCR {done}/{total} 页 (置信度 {conf:.2f})...")
+    # 等待所有 OCR 完成
+    for t in ocr_workers:
+        t.join()
 
     if progress:
         progress(total, total, f"OCR 完成 ({total}/{total} 页)")
@@ -123,14 +121,18 @@ def _ocr_scanned_blocks(blocks: list[dict], progress=None) -> list[dict]:
     return blocks
 
 
-def _extract_cached(path: Path, progress=None) -> list[dict]:
-    """带缓存的单文件抽取（含 OCR）。"""
-    cache_file = _cache_path(path)
-    if cache_file.exists():
+def _extract_cached(path: Path, progress=None, force: bool = False,
+                    session_dir=None) -> list[dict]:
+    """带缓存的单文件抽取（含 OCR）。force=True 时跳过缓存强制重新抽取。"""
+    cache_file = config.cache_path(path, session_dir=session_dir)
+    if not force and cache_file.exists():
         try:
             return pickle.loads(cache_file.read_bytes())
         except (pickle.PickleError, OSError):
             pass
+    else:
+        # force 模式或缓存损坏，删除旧缓存
+        cache_file.unlink(missing_ok=True)
     blocks = extractor.extract(path)
     blocks = _ocr_scanned_blocks(blocks, progress=progress)
     try:
@@ -140,14 +142,10 @@ def _extract_cached(path: Path, progress=None) -> list[dict]:
     return blocks
 
 
-def index_folder(folder: str, progress=None) -> list[dict]:
-    """递归扫描文件夹下所有受支持文件，含 OCR 预处理，返回合并后的 block 列表。"""
-    root = Path(folder)
-    if not root.is_dir():
-        raise NotADirectoryError(f"路径不是有效文件夹：{folder}")
-
+def _process_files(files: list[Path], progress=None, force: bool = False,
+                   session_dir=None) -> list[dict]:
+    """对一组文件路径建索引，串行或并行处理，返回合并后的 block 列表。"""
     config.ensure_dirs()
-    files = [p for p in root.rglob("*") if p.suffix.lower() in _SUPPORTED]
     total = len(files)
 
     if total < _FILE_PARALLEL_THRESHOLD:
@@ -155,19 +153,15 @@ def index_folder(folder: str, progress=None) -> list[dict]:
         for idx, fp in enumerate(files, 1):
             if progress:
                 progress(idx, total, fp.name)
-            # 单文件内部已有子进度，不做额外包装
-            file_blocks = _extract_cached(fp)
-            blocks.extend(file_blocks)
+            blocks.extend(_extract_cached(fp, force=force, session_dir=session_dir))
         return blocks
 
-    # 多文件并行处理（抽取 + OCR 在 _extract_cached 内完成）
     max_workers = min(total, os.cpu_count() or 1, 4)
     results: list[list[dict]] = [[] for _ in range(total)]
     done_count = 0
 
     def _process(idx: int, fp: Path) -> tuple[int, list[dict]]:
-        # 子线程内不传 progress（避免 Streamlit 跨线程 UI 竞争）
-        return idx, _extract_cached(fp)
+        return idx, _extract_cached(fp, force=force, session_dir=session_dir)
 
     with ThreadPoolExecutor(max_workers=max_workers) as ex:
         futures = [ex.submit(_process, i, fp) for i, fp in enumerate(files)]
@@ -184,38 +178,22 @@ def index_folder(folder: str, progress=None) -> list[dict]:
     return merged
 
 
-def index_paths(paths: list[str], progress=None) -> list[dict]:
-    """对一组具体文件路径建索引（用于上传文件已落盘的临时路径）。"""
-    config.ensure_dirs()
-    valid = [(i, Path(p)) for i, p in enumerate(paths)
-             if Path(p).suffix.lower() in _SUPPORTED]
-    total = len(valid)
+def index_folder(folder: str, progress=None, force: bool = False,
+                 session_dir=None) -> list[dict]:
+    """递归扫描文件夹下所有受支持文件，含 OCR 预处理，返回合并后的 block 列表。
+    force=True 时跳过缓存强制重新抽取。"""
+    root = Path(folder)
+    if not root.is_dir():
+        raise NotADirectoryError(f"路径不是有效文件夹：{folder}")
+    files = [p for p in root.rglob("*") if p.suffix.lower() in _SUPPORTED]
+    return _process_files(files, progress=progress, force=force,
+                          session_dir=session_dir)
 
-    if total < _FILE_PARALLEL_THRESHOLD:
-        blocks: list[dict] = []
-        for idx, (i, fp) in enumerate(valid, 1):
-            if progress:
-                progress(idx, total, fp.name)
-            blocks.extend(_extract_cached(fp))
-        return blocks
 
-    max_workers = min(total, os.cpu_count() or 1, 4)
-    results: list[list[dict]] = [[] for _ in range(total)]
-    done_count = 0
-
-    def _process(idx: int, fp: Path) -> tuple[int, list[dict]]:
-        return idx, _extract_cached(fp)
-
-    with ThreadPoolExecutor(max_workers=max_workers) as ex:
-        futures = [ex.submit(_process, i, fp) for i, fp in valid]
-        for fut in futures:
-            idx, file_blocks = fut.result()
-            results[idx] = file_blocks
-            done_count += 1
-            if progress:
-                progress(done_count, total, valid[idx][1].name)
-
-    merged: list[dict] = []
-    for r in results:
-        merged.extend(r)
-    return merged
+def index_paths(paths: list[str], progress=None, force: bool = False,
+                session_dir=None) -> list[dict]:
+    """对一组具体文件路径建索引（用于上传文件已落盘的临时路径）。
+    force=True 时跳过缓存强制重新抽取。"""
+    files = [Path(p) for p in paths if Path(p).suffix.lower() in _SUPPORTED]
+    return _process_files(files, progress=progress, force=force,
+                          session_dir=session_dir)

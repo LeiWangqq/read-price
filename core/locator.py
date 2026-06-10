@@ -105,38 +105,22 @@ def prefilter(blocks: list[dict], query: str) -> list[dict]:
 
 def locate(blocks: list[dict], query: str, cfg: dict = None,
            progress=None) -> tuple[list[dict], list[str]]:
-    """定位流程：预筛 → 精确匹配。
-
-    OCR 在索引阶段已完成，此处直接做文本匹配。
-    """
-    import sys
-
+    """定位流程：预筛 → 精确匹配。"""
     kws = keywords(query)
-    print(f"[locate] blocks={len(blocks)} "
-          f"scanned_with_text={sum(1 for b in blocks if b.get('scanned') and b.get('text'))} "
-          f"scanned_no_text={sum(1 for b in blocks if b.get('scanned') and not b.get('text'))} "
-          f"query=[{query}] keywords={kws}", file=sys.stderr, flush=True)
-
     if not kws:
-        print("[locate] no keywords extracted from query", file=sys.stderr, flush=True)
         return [], []
 
     # 预筛
     candidates = prefilter(blocks, query)
-    print(f"[locate] prefilter → {len(candidates)} candidates", file=sys.stderr, flush=True)
 
     if not candidates:
-        candidates = [b for b in blocks if b.get("text")][:_MAX_FINAL_RESULTS]
-        print(f"[locate] fallback → {len(candidates)} text blocks",
-              file=sys.stderr, flush=True)
-        if not candidates:
-            return [], []
+        return [], []
 
     # 精确匹配
     results: list[dict] = []
     for b in candidates:
         text = b.get("text", "")
-        if any(kw in text for kw in kws):
+        if all(kw in text for kw in kws):
             results.append({
                 "file": b.get("file", ""),
                 "page": str(b.get("page", "")),
@@ -145,7 +129,6 @@ def locate(blocks: list[dict], query: str, cfg: dict = None,
                 "reason": "关键词命中",
             })
 
-    print(f"[locate] final → {len(results)} results", file=sys.stderr, flush=True)
     if len(results) > _MAX_FINAL_RESULTS:
         results = results[:_MAX_FINAL_RESULTS]
     return results, []

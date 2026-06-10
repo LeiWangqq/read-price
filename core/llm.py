@@ -71,8 +71,10 @@ def chat_stream(base_url: str, api_key: str, model: str,
         stream=True,
     )
     for chunk in stream:
+        if not chunk.choices:
+            continue
         delta = chunk.choices[0].delta
-        if delta.content:
+        if delta and delta.content:
             yield delta.content
 
 
@@ -94,16 +96,18 @@ def polish_file(base_url: str, api_key: str, model: str,
     prompt = (
         f"用户在文件「{filename}」中搜索「{query}」，"
         f"找到了 {len(items)} 处匹配内容。\n\n"
-        f"请将每段内容整理为清晰、美观的格式：\n"
-        f"1. 修正 OCR 错误字符和乱码\n"
-        f"2. 保留所有原始信息（数字、日期、金额、单位等不可修改）\n"
-        f"3. 提取与「{query}」最相关的核心信息\n"
-        f"4. 用 Markdown 格式输出，适当使用 **加粗**、表格、列表\n"
-        f"5. 每段用 ### 标注页码和章节\n\n"
+        f"请将搜索结果整理为一个 Markdown 表格，包含以下列：\n"
+        f"| 页码 | 章节 | 内容 |\n\n"
+        f"规则：\n"
+        f"- 同一章节的连续页码可合并为一行，页码列写范围（如 \"5-8\"）\n"
+        f"- 修正 OCR 错误和乱码，保留所有原始数字、日期、金额、单位\n"
+        f"- 内容列提取与「{query}」最相关的核心信息\n"
+        f"- 若内容较长则精简到关键句\n"
+        f"- 不要输出表格以外的多余文字\n\n"
         f"以下是原始内容：\n\n{combined}"
     )
 
     yield from chat_stream(base_url, api_key, model, [
-        {"role": "system", "content": "你是专业的文档内容整理助手，擅长将 OCR 识别的杂乱文字整理为清晰美观的格式。"},
+        {"role": "system", "content": "你是专业的文档内容整理助手，擅长将 OCR 识别的杂乱文字整理为清晰美观的表格。只输出 Markdown 表格，不要多余文字。"},
         {"role": "user", "content": prompt},
     ], temperature=0.1)
